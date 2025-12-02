@@ -1,0 +1,4 @@
+{
+    "command": "pytest",
+    "working_directory": "/home/kavia/workspace/code-generation/claim-audit-invoice-processor-43249/fastapi_backend"
+}
