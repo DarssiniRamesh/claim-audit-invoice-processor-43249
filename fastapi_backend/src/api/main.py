@@ -22,12 +22,13 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
-# CORS: allow frontend at localhost:3000
+# CORS: allow only configured frontend origins; no wildcard when credentials=True
+_allowed_origins = [o.strip() for o in settings.CORS_ORIGINS if o and o.strip() and o.strip() != "*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in settings.CORS_ORIGINS],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
