@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import datetime, date as _date
 from typing import Optional
 
 from sqlalchemy import (
@@ -40,7 +40,7 @@ class Invoice(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
     vendor_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     invoice_number: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
-    invoice_date: Mapped[Optional[datetime]] = mapped_column(Date, nullable=True, index=True)
+    invoice_date: Mapped[Optional[_date]] = mapped_column(Date, nullable=True, index=True)
     currency: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
 
     subtotal: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

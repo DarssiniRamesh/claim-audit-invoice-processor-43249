@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import UUID4
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -27,6 +28,7 @@ from src.services.extraction.pdf_extractor import PDFExtractor, PDFExtractionErr
 from src.services.normalization.normalizer import Normalizer
 
 router = APIRouter()
+logger = logging.getLogger("app.api.invoices")
 
 
 def _to_invoice_out(inv: Invoice) -> InvoiceOut:
@@ -60,6 +62,20 @@ def _to_invoice_out(inv: Invoice) -> InvoiceOut:
     )
 
 
+def _coerce_iso_date(val: Optional[object]) -> Optional[date]:
+    """Best-effort convert an ISO date string to date, otherwise return as-is if date, else None."""
+    if val is None:
+        return None
+    if isinstance(val, date) and not isinstance(val, datetime):
+        return val
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val).date()
+        except Exception:
+            return None
+    return None
+
+
 # PUBLIC_INTERFACE
 @router.post(
     "/upload",
@@ -72,6 +88,7 @@ def _to_invoice_out(inv: Invoice) -> InvoiceOut:
         400: {"description": "Invalid file"},
         413: {"description": "File too large"},
         422: {"description": "Unprocessable PDF"},
+        500: {"description": "Server error while persisting invoice"},
     },
 )
 async def upload_invoice(
@@ -87,52 +104,195 @@ async def upload_invoice(
     if len(data) > settings.MAX_UPLOAD_SIZE:
         raise HTTPException(status_code=413, detail="File too large.")
 
+    logger.info("Starting PDF extraction for upload: filename=%s size=%d", file.filename, len(data))
     extractor = PDFExtractor(timeout_seconds=settings.PDF_EXTRACTION_TIMEOUT)
     try:
         raw_text = await extractor.extract_text(data)
+        logger.info("PDF extraction complete for filename=%s (chars=%d)", file.filename, len(raw_text or ""))  # type: ignore[arg-type]
     except PDFExtractionError as e:
+        logger.warning("PDF extraction failed for filename=%s error=%s", file.filename, e)
         raise HTTPException(status_code=422, detail=str(e))
 
     # Parse normalized header and items
     normalizer = Normalizer()
     header, items = normalizer.parse_invoice(raw_text)
+    logger.debug("Normalization complete for filename=%s header_keys=%s items_count=%d", file.filename, list(header.keys()), len(items))
 
-    # Persist entities
-    inv = Invoice(
-        vendor_name=header.get("vendor_name"),
-        invoice_number=header.get("invoice_number"),
-        invoice_date=header.get("invoice_date"),
-        currency=header.get("currency"),
-        subtotal=header.get("subtotal"),
-        tax=header.get("tax"),
-        total=header.get("total"),
-        grand_total=header.get("grand_total"),
-        status="uploaded",
-    )
-    session.add(inv)
-    await session.flush()  # Get inv.id
-
-    raw = InvoiceRaw(invoice_id=inv.id, raw_text=raw_text, meta={"filename": file.filename})
-    session.add(raw)
-
-    for it in items:
-        li = LineItem(
-            invoice_id=inv.id,
-            description=it["description"],
-            quantity=it.get("quantity"),
-            unit=it.get("unit"),
-            unit_price=it.get("unit_price"),
-            total_price=it.get("total_price"),
-            category=it.get("category"),
-            normalized_unit=it.get("normalized_unit"),
-            normalized_quantity=it.get("normalized_quantity"),
-            normalized_unit_price=it.get("normalized_unit_price"),
-            flagged_high_value=bool(it.get("flagged_high_value", False)),
+    # Persist entities with robust error handling and explicit commit
+    try:
+        inv = Invoice(
+            vendor_name=header.get("vendor_name"),
+            invoice_number=header.get("invoice_number"),
+            invoice_date=_coerce_iso_date(header.get("invoice_date")),
+            currency=header.get("currency"),
+            subtotal=header.get("subtotal"),
+            tax=header.get("tax"),
+            total=header.get("total"),
+            grand_total=header.get("grand_total"),
+            status="uploaded",
         )
-        session.add(li)
+        session.add(inv)
+        await session.flush()  # Get inv.id
 
-    await session.commit()
-    return UploadResponse(invoice_id=inv.id)
+        raw = InvoiceRaw(invoice_id=inv.id, raw_text=raw_text, meta={"filename": file.filename})
+        session.add(raw)
+
+        for it in items:
+            li = LineItem(
+                invoice_id=inv.id,
+                description=it["description"],
+                quantity=it.get("quantity"),
+                unit=it.get("unit"),
+                unit_price=it.get("unit_price"),
+                total_price=it.get("total_price"),
+                category=it.get("category"),
+                normalized_unit=it.get("normalized_unit"),
+                normalized_quantity=it.get("normalized_quantity"),
+                normalized_unit_price=it.get("normalized_unit_price"),
+                flagged_high_value=bool(it.get("flagged_high_value", False)),
+            )
+            session.add(li)
+
+        await session.commit()
+        logger.info("Invoice persisted successfully id=%s filename=%s items=%d", inv.id, file.filename, len(items))
+        return UploadResponse(invoice_id=inv.id)
+    except HTTPException:
+        # pass through existing HTTPExceptions
+        raise
+    except Exception as e:
+        logger.exception("Failed to persist invoice for filename=%s error=%s", file.filename, e)
+        await session.rollback()
+        raise HTTPException(status_code=500, detail="Failed to persist invoice.")
+
+
+# PUBLIC_INTERFACE
+@router.post(
+    "/{invoice_id}/reupload",
+    response_model=InvoiceOut,
+    summary="Re-upload updated invoice PDF and force re-extraction",
+    description=(
+        "Accepts a replacement PDF for an existing invoice, synchronously re-extracts and re-normalizes content, "
+        "replaces header, line items, and raw text, commits the transaction, and returns the updated invoice. "
+        "This ensures GET /api/invoices/{invoice_id} reflects fresh data."
+    ),
+    responses={
+        200: {"description": "Invoice re-extracted and updated"},
+        400: {"description": "Invalid file or line item mismatch"},
+        404: {"description": "Invoice not found"},
+        413: {"description": "File too large"},
+        422: {"description": "Unprocessable PDF"},
+        500: {"description": "Server error while updating invoice"},
+    },
+)
+async def reupload_invoice(
+    invoice_id: UUID4,
+    file: UploadFile = File(..., description="Updated invoice PDF to re-extract"),
+    session: AsyncSession = Depends(get_session),
+) -> InvoiceOut:
+    """Force re-extraction by replacing the stored PDF and re-parsing header and line items for an existing invoice."""
+    settings = get_settings()
+    if file.content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    inv: Optional[Invoice] = (
+        (
+            await session.execute(
+                select(Invoice).where(Invoice.id == str(invoice_id))
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    data = await file.read()
+    if len(data) > settings.MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="File too large.")
+
+    logger.info("Starting PDF re-extraction for invoice_id=%s filename=%s size=%d", invoice_id, file.filename, len(data))
+    extractor = PDFExtractor(timeout_seconds=settings.PDF_EXTRACTION_TIMEOUT)
+    try:
+        raw_text = await extractor.extract_text(data)
+        logger.info("PDF re-extraction complete for invoice_id=%s filename=%s (chars=%d)", invoice_id, file.filename, len(raw_text or ""))  # type: ignore[arg-type]
+    except PDFExtractionError as e:
+        logger.warning("PDF re-extraction failed for invoice_id=%s filename=%s error=%s", invoice_id, file.filename, e)
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Normalize
+    normalizer = Normalizer()
+    header, items = normalizer.parse_invoice(raw_text)
+    logger.debug("Re-normalization complete for invoice_id=%s items_count=%d", invoice_id, len(items))
+
+    # Persist changes: update header, replace line items, update raw text; ensure commit before responding
+    try:
+        # Update header fields
+        inv.vendor_name = header.get("vendor_name")
+        inv.invoice_number = header.get("invoice_number")
+        inv.invoice_date = _coerce_iso_date(header.get("invoice_date"))
+        inv.currency = header.get("currency")
+        inv.subtotal = header.get("subtotal")
+        inv.tax = header.get("tax")
+        inv.total = header.get("total")
+        inv.grand_total = header.get("grand_total")
+        inv.status = "uploaded"
+
+        # Update or create raw text row
+        raw_row: Optional[InvoiceRaw] = (
+            (
+                await session.execute(
+                    select(InvoiceRaw).where(InvoiceRaw.invoice_id == inv.id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        meta_update = {"filename": file.filename, "reuploaded_at": datetime.utcnow().isoformat()}
+        if raw_row:
+            raw_row.raw_text = raw_text
+            raw_row.meta = {**(raw_row.meta or {}), **meta_update}
+        else:
+            session.add(InvoiceRaw(invoice_id=inv.id, raw_text=raw_text, meta=meta_update))
+
+        # Replace line items
+        await session.execute(delete(LineItem).where(LineItem.invoice_id == inv.id))
+        for it in items:
+            li = LineItem(
+                invoice_id=inv.id,
+                description=it["description"],
+                quantity=it.get("quantity"),
+                unit=it.get("unit"),
+                unit_price=it.get("unit_price"),
+                total_price=it.get("total_price"),
+                category=it.get("category"),
+                normalized_unit=it.get("normalized_unit"),
+                normalized_quantity=it.get("normalized_quantity"),
+                normalized_unit_price=it.get("normalized_unit_price"),
+                flagged_high_value=bool(it.get("flagged_high_value", False)),
+            )
+            session.add(li)
+
+        await session.commit()
+        # Re-fetch with line items to ensure returning fresh state
+        inv_fresh: Optional[Invoice] = (
+            (
+                await session.execute(
+                    select(Invoice)
+                    .options(selectinload(Invoice.line_items))
+                    .where(Invoice.id == str(invoice_id))
+                )
+            )
+            .scalars()
+            .first()
+        )
+        logger.info("Invoice re-upload persisted successfully id=%s filename=%s items=%d", invoice_id, file.filename, len(items))
+        return _to_invoice_out(inv_fresh or inv)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to update invoice on re-upload invoice_id=%s error=%s", invoice_id, e)
+        await session.rollback()
+        raise HTTPException(status_code=500, detail="Failed to update invoice after re-extraction.")
 
 
 # PUBLIC_INTERFACE
