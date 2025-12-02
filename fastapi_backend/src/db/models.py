@@ -108,7 +108,6 @@ class LineItem(Base):
     invoice: Mapped["Invoice"] = relationship(back_populates="line_items")
 
     __table_args__ = (
-        Index("ix_line_items_invoice_id", "invoice_id"),
         CheckConstraint("quantity IS NULL OR quantity >= 0", name="ck_qty_non_negative"),
         CheckConstraint("unit_price IS NULL OR unit_price >= 0", name="ck_unit_price_non_negative"),
         CheckConstraint("total_price IS NULL OR total_price >= 0", name="ck_total_non_negative"),
