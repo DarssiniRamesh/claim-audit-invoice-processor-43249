@@ -49,8 +49,22 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 # PUBLIC_INTERFACE
 async def init_db() -> None:
-    """Create database tables if they don't exist."""
+    """Create database tables if they don't exist and apply lightweight migrations for SQLite."""
     from src.db import models  # Import models so metadata is populated
 
     async with engine.begin() as conn:
         await conn.run_sync(models.Base.metadata.create_all)
+
+        # Lightweight SQLite migrations (non-destructive: add missing columns)
+        url = _settings.DATABASE_URL
+        if url.startswith("sqlite+aiosqlite:///"):
+            def _apply_sqlite_migrations_sync(sconn) -> None:
+                # Helper to check if a column exists
+                def _has_column(table: str, column: str) -> bool:
+                    rows = sconn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+                    return any(r[1] == column for r in rows)
+
+                # Add currency column to line_items if missing
+                if not _has_column("line_items", "currency"):
+                    sconn.exec_driver_sql("ALTER TABLE line_items ADD COLUMN currency VARCHAR(10)")
+            await conn.run_sync(_apply_sqlite_migrations_sync)

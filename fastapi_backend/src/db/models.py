@@ -96,6 +96,7 @@ class LineItem(Base):
     unit: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     unit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     total_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    currency: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
 
     category: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 

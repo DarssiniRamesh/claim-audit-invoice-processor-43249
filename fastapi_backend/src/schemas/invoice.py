@@ -15,6 +15,7 @@ class LineItemOut(BaseModel):
     unit: Optional[str] = Field(None, description="Original unit as parsed from the invoice")
     unit_price: Optional[float] = Field(None, description="Unit price for the item")
     total_price: Optional[float] = Field(None, description="Total price for the item")
+    currency: Optional[str] = Field(None, description="Currency code for this line item, e.g., USD")
 
     category: Optional[str] = Field(None, description="Inferred category")
     normalized_unit: Optional[str] = Field(None, description="Standardized unit")
