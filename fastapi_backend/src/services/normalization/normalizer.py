@@ -217,6 +217,18 @@ def _infer_unit_from_tokens(tokens: List[str]) -> Optional[str]:
     return None
 
 
+def _derive_tax_amount(quantity: Optional[float], unit_price: Optional[float], total: Optional[float]) -> Optional[float]:
+    """Derive per-line tax amount as total - (quantity * unit_price) when all are available and tax is positive."""
+    if quantity is None or unit_price is None or total is None:
+        return None
+    base = round(quantity * unit_price, 2)
+    tax = round(total - base, 2)
+    # Consider small negatives from rounding as zero
+    if tax >= 0.01:
+        return tax
+    return None
+
+
 def _parse_line_item_from_tokens(line: str, default_currency: Optional[str]) -> Optional[Dict[str, Any]]:
     """Attempt to parse a line item from a line of text using multiple heuristics.
 
@@ -276,6 +288,7 @@ def _parse_line_item_from_tokens(line: str, default_currency: Optional[str]) -> 
             "normalized_unit": unit,
             "normalized_quantity": qty,
             "normalized_unit_price": unit_price,
+            "tax_amount": _derive_tax_amount(qty, unit_price, total),
             "confidence": confidence,
         }
 
@@ -352,6 +365,7 @@ def _parse_line_item_from_tokens(line: str, default_currency: Optional[str]) -> 
                 "normalized_unit": unit,
                 "normalized_quantity": qty,
                 "normalized_unit_price": unit_price,
+                "tax_amount": _derive_tax_amount(qty, unit_price, total),
                 "confidence": confidence,
             }
 
@@ -378,6 +392,7 @@ def _parse_line_item_from_tokens(line: str, default_currency: Optional[str]) -> 
             "normalized_unit": None,
             "normalized_quantity": None,
             "normalized_unit_price": None,
+            "tax_amount": None,
             "confidence": 0.6 if total is not None else 0.4,
         }
 
@@ -440,7 +455,7 @@ class Normalizer:
 
         # Extract common fields
         patterns = {
-            "invoice_number": r"(?:Invoice\s*(?:No\.|#|Number)[:\s]*)([A-Za-z0-9\-/]+)",
+            "invoice_number": r"(?:Invoice\s*(?:No\.|#|Number)[:\s]*)([A-Za-z0-9\-\/]+)",
             "invoice_date": r"(?:Invoice\s*Date|Date)[:\s]*([0-9/\-]{6,10})",
             "subtotal": r"(?:Subtotal)[:\s]*(?:(?P<sub_cur>[A-Za-z]{3}|[$€£])\s*)?(?P<sub_amt>[\d\.,\s'()-]+)",
             "tax": r"(?:Tax)[:\s]*(?:(?P<tax_cur>[A-Za-z]{3}|[$€£])\s*)?(?P<tax_amt>[\d\.,\s'()-]+)",
@@ -482,7 +497,7 @@ class Normalizer:
             it = _parse_line_item_from_tokens(line, header.get("currency"))
             if it:
                 # Ensure currency per line; detect from line if possible
-                cur_line, cur_conf_line, _method = detect_currency_in_text(line)
+                cur_line, _cur_conf_line, _method = detect_currency_in_text(line)
                 if cur_line:
                     it["currency"] = cur_line
                 elif not it.get("currency"):
@@ -515,6 +530,7 @@ class Normalizer:
                             "normalized_unit": None,
                             "normalized_quantity": None,
                             "normalized_unit_price": None,
+                            "tax_amount": None,
                             "confidence": 0.55 if total is not None else 0.4,
                             "flagged_high_value": bool((total or 0.0) >= 500.0) if total is not None else False,
                         }

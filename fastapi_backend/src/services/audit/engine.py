@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import select, delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import AuditFinding, Benchmark, Invoice, LineItem, Severity
@@ -22,19 +22,24 @@ def _float(x: Optional[float]) -> float:
 
 
 class AuditEngine:
-    """Applies audit rules to an invoice and persists findings."""
+    """Applies audit rules to an invoice and persists findings; computes structured sections."""
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
     # PUBLIC_INTERFACE
-    async def run(self, invoice_id: str) -> List[AuditFinding]:
-        """Run audit rules for a specific invoice and persist findings."""
+    async def run(self, invoice_id: str) -> Tuple[List[AuditFinding], Dict]:
+        """Run audit rules for a specific invoice, persist findings, and compute purchase audit.
+
+        Returns:
+            findings: List of saved AuditFinding ORM records
+            purchase_section: dict matching PurchaseAuditSection schema
+        """
         invoice = (
             await self.session.execute(select(Invoice).where(Invoice.id == invoice_id))
         ).scalars().first()
         if not invoice:
-            return []
+            return [], {"tax_rate_inferred": None, "items": []}
 
         items: List[LineItem] = (
             await self.session.execute(select(LineItem).where(LineItem.invoice_id == invoice_id))
@@ -69,7 +74,9 @@ class AuditEngine:
         saved = (
             await self.session.execute(select(AuditFinding).where(AuditFinding.invoice_id == invoice_id))
         ).scalars().all()
-        return list(saved)
+
+        purchase_section = self._compute_purchase_audit(invoice, items)
+        return list(saved), purchase_section
 
     def _required_fields(self, invoice: Invoice) -> List[FindingSpec]:
         missing = []
@@ -178,3 +185,48 @@ class AuditEngine:
                     )
                 )
         return findings
+
+    def _compute_purchase_audit(self, invoice: Invoice, items: List[LineItem]) -> Dict:
+        """Build purchase audit section with inferred tax rate and per-line validations."""
+        tax_rate = None
+        if invoice.subtotal is not None and invoice.subtotal > 0 and invoice.tax is not None:
+            tax_rate = round(float(invoice.tax) / float(invoice.subtotal), 6)
+
+        results: List[Dict] = []
+        tolerance = 0.05  # 5 cents tolerance for rounding
+
+        for it in items:
+            qty = it.quantity
+            unit_price = it.unit_price
+            total = it.total_price
+            base = round(qty * unit_price, 2) if (qty is not None and unit_price is not None) else None
+            derived_tax = None
+            if base is not None and total is not None:
+                derived_tax = round(total - base, 2)
+                if derived_tax < 0.01:
+                    derived_tax = None
+
+            expected_tax = None
+            if tax_rate is not None and base is not None:
+                expected_tax = round(base * tax_rate, 2)
+
+            tax_ok: Optional[bool] = None
+            if derived_tax is not None and expected_tax is not None:
+                tax_ok = abs(derived_tax - expected_tax) <= tolerance
+
+            results.append(
+                {
+                    "line_item_id": it.id,
+                    "description": it.description,
+                    "quantity": qty,
+                    "unit_price": unit_price,
+                    "total_price": total,
+                    "currency": it.currency,
+                    "tax_amount": derived_tax,
+                    "expected_tax": expected_tax,
+                    "tax_rate_used": tax_rate,
+                    "tax_ok": tax_ok,
+                }
+            )
+
+        return {"tax_rate_inferred": tax_rate, "items": results}

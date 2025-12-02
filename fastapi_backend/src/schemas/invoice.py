@@ -22,6 +22,9 @@ class LineItemOut(BaseModel):
     normalized_quantity: Optional[float] = Field(None, description="Standardized quantity")
     normalized_unit_price: Optional[float] = Field(None, description="Standardized unit price")
 
+    tax_amount: Optional[float] = Field(
+        None, description="Extracted or derived tax amount for this line item (if available)"
+    )
     flagged_high_value: bool = Field(False, description="True if total meets or exceeds the high-value threshold")
 
 

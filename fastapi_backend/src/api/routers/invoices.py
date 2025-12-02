@@ -487,13 +487,20 @@ async def list_invoices(
     "/{invoice_id}/audit",
     response_model=AuditReport,
     summary="Run and return audit findings for an invoice",
-    description="Applies audit rules and persists findings. Returns structured findings and severity.",
+    description=(
+        "Applies audit rules and persists findings. Returns structured report with two sections: "
+        "General Audit (rule findings) and Purchase Audit (per-line tax extraction and validation)."
+    ),
 )
 async def get_invoice_audit(
     invoice_id: UUID4,
     session: AsyncSession = Depends(get_session),
 ) -> AuditReport:
-    """Run the audit rules for the given invoice and return the findings."""
+    """Run audit rules and return structured report with General and Purchase sections.
+
+    - General: Required field checks, totals consistency, high value items, benchmark price checks.
+    - Purchase: Per-line item view with inferred tax rate, derived line tax (if detectable), and validation.
+    """
     inv = (
         await session.execute(select(Invoice).where(Invoice.id == str(invoice_id)))
     ).scalars().first()
@@ -501,8 +508,8 @@ async def get_invoice_audit(
         raise HTTPException(status_code=404, detail="Invoice not found")
 
     engine = AuditEngine(session)
-    findings = await engine.run(str(invoice_id))
-    out = [
+    findings, purchase = await engine.run(str(invoice_id))
+    general_out = [
         AuditFindingOut(
             id=f.id,
             code=f.code,
@@ -512,7 +519,12 @@ async def get_invoice_audit(
         )
         for f in findings
     ]
-    return AuditReport(invoice_id=str(invoice_id), findings=out)
+    # Compose structured response; pydantic will validate nested sections
+    return AuditReport(
+        invoice_id=str(invoice_id),
+        general={"findings": general_out},
+        purchase=purchase,
+    )
 
 
 # PUBLIC_INTERFACE
