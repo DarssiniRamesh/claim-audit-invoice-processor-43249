@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import AsyncGenerator
 
@@ -10,6 +11,7 @@ from src.core.config import get_settings
 
 # Shared declarative base for ORM models
 Base = declarative_base()
+logger = logging.getLogger("app.db")
 
 _settings = get_settings()
 
@@ -25,6 +27,7 @@ def _ensure_sqlite_dir(url: str) -> None:
             db_path = Path.cwd() / path_part
         db_dir = db_path.parent
         db_dir.mkdir(parents=True, exist_ok=True)
+        logger.debug("Ensured SQLite directory: %s", db_dir)
 
 
 _ensure_sqlite_dir(_settings.DATABASE_URL)
@@ -67,4 +70,11 @@ async def init_db() -> None:
                 # Add currency column to line_items if missing
                 if not _has_column("line_items", "currency"):
                     sconn.exec_driver_sql("ALTER TABLE line_items ADD COLUMN currency VARCHAR(10)")
+                    try:
+                        # Best-effort log via print since we're in sync context
+                        print("[DB MIGRATION] Added 'currency' column to 'line_items'")
+                    except Exception:
+                        pass
+
             await conn.run_sync(_apply_sqlite_migrations_sync)
+            logger.debug("SQLite lightweight migrations applied (if needed).")

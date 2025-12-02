@@ -9,6 +9,7 @@ from pydantic import UUID4
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import IntegrityError
 
 from src.core.config import get_settings
 from src.db.models import Invoice, InvoiceRaw, LineItem, ValidationEdit
@@ -109,7 +110,11 @@ async def upload_invoice(
     extractor = PDFExtractor(timeout_seconds=settings.PDF_EXTRACTION_TIMEOUT)
     try:
         raw_text = await extractor.extract_text(data)
-        logger.info("PDF extraction complete for filename=%s (chars=%d)", file.filename, len(raw_text or ""))  # type: ignore[arg-type]
+        logger.info(
+            "PDF extraction complete for filename=%s (chars=%d)",
+            file.filename,
+            len(raw_text or ""),  # type: ignore[arg-type]
+        )
     except PDFExtractionError as e:
         logger.warning("PDF extraction failed for filename=%s error=%s", file.filename, e)
         raise HTTPException(status_code=422, detail=str(e))
@@ -117,13 +122,19 @@ async def upload_invoice(
     # Parse normalized header and items
     normalizer = Normalizer()
     header, items = normalizer.parse_invoice(raw_text)
-    logger.debug("Normalization complete for filename=%s header_keys=%s items_count=%d", file.filename, list(header.keys()), len(items))
+    logger.debug(
+        "Normalization complete for filename=%s header_keys=%s items_count=%d",
+        file.filename,
+        list(header.keys()),
+        len(items),
+    )
 
     # Persist entities with robust error handling and explicit commit
     try:
+        logger.debug("DB transaction start for upload: filename=%s", file.filename)
         inv = Invoice(
             vendor_name=header.get("vendor_name"),
-            invoice_number=header.get("invoice_number"),
+            invoice_number=(header.get("invoice_number")[:100] if header.get("invoice_number") else None),
             invoice_date=_coerce_iso_date(header.get("invoice_date")),
             currency=header.get("currency"),
             subtotal=header.get("subtotal"),
@@ -133,19 +144,44 @@ async def upload_invoice(
             status="uploaded",
         )
         session.add(inv)
-        await session.flush()  # Get inv.id
+        await session.flush()  # Get inv.id early for FKs
+        logger.debug("Invoice inserted and flushed: id=%s", inv.id)
 
-        raw = InvoiceRaw(invoice_id=inv.id, raw_text=raw_text, meta={"filename": file.filename})
+        raw = InvoiceRaw(invoice_id=inv.id, raw_text=raw_text or "", meta={"filename": file.filename})
         session.add(raw)
+        logger.debug("InvoiceRaw staged for invoice_id=%s", inv.id)
 
+        skipped_discount = 0
+        saved = 0
         for it in items:
+            desc = (it.get("description") or "").strip()
+            if not desc:
+                logger.debug("Skipping line item with empty description (invoice_id=%s)", inv.id)
+                continue
+
+            qty = it.get("quantity")
+            unit_price = it.get("unit_price")
+            total_price = it.get("total_price")
+
+            # Coerce or skip to satisfy integrity constraints (non-negative checks)
+            if qty is not None and qty < 0:
+                logger.warning("Negative quantity detected; coercing to abs (desc=%s, qty=%s)", desc, qty)
+                qty = abs(qty)
+            if unit_price is not None and unit_price < 0:
+                logger.warning("Negative unit_price detected; coercing to abs (desc=%s, unit_price=%s)", desc, unit_price)
+                unit_price = abs(unit_price)
+            if total_price is not None and total_price < 0:
+                skipped_discount += 1
+                logger.info("Skipping discount/credit line (negative total) (desc=%s, total=%s)", desc, total_price)
+                continue
+
             li = LineItem(
                 invoice_id=inv.id,
-                description=it["description"],
-                quantity=it.get("quantity"),
+                description=desc,
+                quantity=qty,
                 unit=it.get("unit"),
-                unit_price=it.get("unit_price"),
-                total_price=it.get("total_price"),
+                unit_price=unit_price,
+                total_price=total_price,
                 currency=it.get("currency"),
                 category=it.get("category"),
                 normalized_unit=it.get("normalized_unit"),
@@ -154,16 +190,35 @@ async def upload_invoice(
                 flagged_high_value=bool(it.get("flagged_high_value", False)),
             )
             session.add(li)
+            saved += 1
 
+        logger.debug(
+            "Before commit: invoice_id=%s items_saved=%d items_skipped_discount=%d",
+            inv.id, saved, skipped_discount
+        )
         await session.commit()
-        logger.info("Invoice persisted successfully id=%s filename=%s items=%d", inv.id, file.filename, len(items))
+        logger.info(
+            "Invoice persisted successfully id=%s filename=%s items_saved=%d items_skipped_discount=%d",
+            inv.id, file.filename, saved, skipped_discount
+        )
         return UploadResponse(invoice_id=inv.id)
     except HTTPException:
         # pass through existing HTTPExceptions
         raise
+    except IntegrityError as e:
+        logger.exception("Integrity error while persisting invoice filename=%s", file.filename)
+        try:
+            await session.rollback()
+        except Exception:
+            logger.debug("Rollback after integrity error attempted.")
+        message = str(getattr(e, "orig", e))
+        raise HTTPException(status_code=422, detail=f"Data integrity violation while saving invoice: {message}")
     except Exception as e:
         logger.exception("Failed to persist invoice for filename=%s error=%s", file.filename, e)
-        await session.rollback()
+        try:
+            await session.rollback()
+        except Exception:
+            logger.debug("Rollback after general error attempted.")
         raise HTTPException(status_code=500, detail="Failed to persist invoice.")
 
 
@@ -216,7 +271,10 @@ async def reupload_invoice(
     extractor = PDFExtractor(timeout_seconds=settings.PDF_EXTRACTION_TIMEOUT)
     try:
         raw_text = await extractor.extract_text(data)
-        logger.info("PDF re-extraction complete for invoice_id=%s filename=%s (chars=%d)", invoice_id, file.filename, len(raw_text or ""))  # type: ignore[arg-type]
+        logger.info(
+            "PDF re-extraction complete for invoice_id=%s filename=%s (chars=%d)",
+            invoice_id, file.filename, len(raw_text or ""),  # type: ignore[arg-type]
+        )
     except PDFExtractionError as e:
         logger.warning("PDF re-extraction failed for invoice_id=%s filename=%s error=%s", invoice_id, file.filename, e)
         raise HTTPException(status_code=422, detail=str(e))
@@ -228,6 +286,7 @@ async def reupload_invoice(
 
     # Persist changes: update header, replace line items, update raw text; ensure commit before responding
     try:
+        logger.debug("DB transaction start for reupload: invoice_id=%s", invoice_id)
         # Update header fields
         inv.vendor_name = header.get("vendor_name")
         inv.invoice_number = header.get("invoice_number")
@@ -258,14 +317,38 @@ async def reupload_invoice(
 
         # Replace line items
         await session.execute(delete(LineItem).where(LineItem.invoice_id == inv.id))
+        skipped_discount = 0
+        saved = 0
         for it in items:
+            desc = (it.get("description") or "").strip()
+            if not desc:
+                logger.debug("Skipping empty-description line item on reupload for invoice_id=%s", invoice_id)
+                continue
+
+            qty = it.get("quantity")
+            unit_price = it.get("unit_price")
+            total_price = it.get("total_price")
+
+            # Coerce to non-negative for integrity constraints; skip negative totals as discounts/credits
+            if qty is not None and qty < 0:
+                logger.warning("Negative quantity detected on reupload; coercing to abs (desc=%s, qty=%s)", desc, qty)
+                qty = abs(qty)
+            if unit_price is not None and unit_price < 0:
+                logger.warning("Negative unit_price detected on reupload; coercing to abs (desc=%s, unit_price=%s)", desc, unit_price)
+                unit_price = abs(unit_price)
+            if total_price is not None and total_price < 0:
+                skipped_discount += 1
+                logger.info("Skipping discount/credit line (negative total) on reupload (desc=%s, total=%s)", desc, total_price)
+                continue
+
             li = LineItem(
                 invoice_id=inv.id,
-                description=it["description"],
-                quantity=it.get("quantity"),
+                description=desc,
+                quantity=qty,
                 unit=it.get("unit"),
-                unit_price=it.get("unit_price"),
-                total_price=it.get("total_price"),
+                unit_price=unit_price,
+                total_price=total_price,
+                currency=it.get("currency"),
                 category=it.get("category"),
                 normalized_unit=it.get("normalized_unit"),
                 normalized_quantity=it.get("normalized_quantity"),
@@ -273,7 +356,12 @@ async def reupload_invoice(
                 flagged_high_value=bool(it.get("flagged_high_value", False)),
             )
             session.add(li)
+            saved += 1
 
+        logger.debug(
+            "Before commit (reupload): invoice_id=%s items_saved=%d items_skipped_discount=%d",
+            invoice_id, saved, skipped_discount
+        )
         await session.commit()
         # Re-fetch with line items to ensure returning fresh state
         inv_fresh: Optional[Invoice] = (
@@ -287,13 +375,27 @@ async def reupload_invoice(
             .scalars()
             .first()
         )
-        logger.info("Invoice re-upload persisted successfully id=%s filename=%s items=%d", invoice_id, file.filename, len(items))
+        logger.info(
+            "Invoice re-upload persisted successfully id=%s filename=%s items_saved=%d items_skipped_discount=%d",
+            invoice_id, file.filename, saved, skipped_discount
+        )
         return _to_invoice_out(inv_fresh or inv)
     except HTTPException:
         raise
+    except IntegrityError as e:
+        logger.exception("Integrity error while updating invoice on re-upload invoice_id=%s", invoice_id)
+        try:
+            await session.rollback()
+        except Exception:
+            logger.debug("Rollback after integrity error attempted (reupload).")
+        message = str(getattr(e, "orig", e))
+        raise HTTPException(status_code=422, detail=f"Data integrity violation while updating invoice: {message}")
     except Exception as e:
         logger.exception("Failed to update invoice on re-upload invoice_id=%s error=%s", invoice_id, e)
-        await session.rollback()
+        try:
+            await session.rollback()
+        except Exception:
+            logger.debug("Rollback after general error attempted (reupload).")
         raise HTTPException(status_code=500, detail="Failed to update invoice after re-extraction.")
 
 
